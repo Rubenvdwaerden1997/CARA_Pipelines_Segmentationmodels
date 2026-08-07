@@ -11,7 +11,7 @@
 #SBATCH -e slurm_output/_slurm_error_predict_v2_%j.txt
 #SBATCH --exclude=dlc-mewtwo
 
-cd /data/diag/rubenvdw/Pipeline_3DUnet/Pipeline/
+cd /data/diag/rubenvdw/CARA_Pipelines_Segmentationmodels/Pipeline_3DUnet/Pipeline/
 
 pip3 install numba monai
 

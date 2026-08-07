@@ -35,14 +35,23 @@ from postprocessing_conditionalinr import load_classes_pixels, postprocess_nifti
 _DEFAULT_POSTPROCESS_CONFIG = os.path.join(current_dir, "postprocessing_classes_conditionalinr.txt")
 
 
-def preprocess_dicom_volume(dcm_path, LUT, circular_mask_channel3, circular_mask_channel1):
+def preprocess_dicom_volume(dcm_path, LUT, circular_mask_channel3, circular_mask_channel1,
+                             normalize_foreground_only=False):
     """DICOM -> preprocessed [D,704,704] float32 volume.
 
     Mirrors Pipeline_withoutinternalsaving.preprocess_data(): circular mask ->
-    (RGB only) LUT grayscale conversion -> whole-volume z-score normalization.
-    Deliberately DROPS the old pipeline's sliding_window_view 7-frame-context
-    step -- Conditional INR consumes the full volume via 3D patches, not a
+    (RGB only) LUT grayscale conversion -> z-score normalization. Deliberately
+    DROPS the old pipeline's sliding_window_view 7-frame-context step --
+    Conditional INR consumes the full volume via 3D patches, not a
     fixed-channel 2D stack.
+
+    normalize_foreground_only: if True, the z-score mean/std are computed only
+    over pixels inside the circular FOV (matching the "*_foregroundnorm"
+    models' training data, built from the same-named dataset, which excludes
+    the masked-out black corners/watermark from the normalization stats --
+    including them dilutes mean/std and shifts the input distribution the
+    model actually saw at training time). If False, stats are computed over
+    the whole square (matching the original models trained before 2026-07-31).
 
     Returns None (fail-soft, same as the old pipeline) if the DICOM shape
     doesn't match the expected (frames, 704, 704, channels).
@@ -69,9 +78,23 @@ def preprocess_dicom_volume(dcm_path, LUT, circular_mask_channel3, circular_mask
         gray = arr_masked.squeeze()
 
     gray = gray.astype(np.float32, copy=False)
-    mean = gray.mean()
-    std  = gray.std()
-    gray = (gray - mean) / (std + 1e-8)
+
+    if normalize_foreground_only:
+        # inv_mask carries a leading batch dim and (for RGB input) repeated color
+        # channels (create_circular_mask(..., channels=3) -> shape (1,H,W,3));
+        # collapse to a plain [H,W] plane so it aligns with gray's [D,H,W].
+        foreground = np.squeeze(inv_mask)
+        while foreground.ndim > 2:
+            foreground = foreground[..., 0]
+        foreground_values = gray[:, foreground]
+        mean = foreground_values.mean()
+        std  = foreground_values.std()
+        gray = (gray - mean) / (std + 1e-5)
+        gray[:, ~foreground] = 0
+    else:
+        mean = gray.mean()
+        std  = gray.std()
+        gray = (gray - mean) / (std + 1e-8)
 
     return gray   # [D, 704, 704] float32
 
@@ -101,6 +124,15 @@ def main():
                               "the decode loop excluded). ~23%% faster if enabled, at that "
                               "boundary-accuracy risk.")
     parser.add_argument('--device',      type=str, default='cuda', help="cuda or cpu")
+    parser.add_argument('--normalize_foreground_only', action='store_true',
+                         help="Compute z-score mean/std only over pixels inside the circular "
+                              "FOV, excluding the masked-out black corners/watermark. Required "
+                              "for models trained on the foreground-normalized dataset (any "
+                              "'*_foregroundnorm' model_dir, built from "
+                              "3D_Grayscale_Circmask_ForegroundZNorm_..._31072026) -- omitting "
+                              "it silently mismatches training-time normalization and degrades "
+                              "predictions. Leave off for models trained before 2026-07-31 "
+                              "(whole-square normalization).")
     parser.add_argument('--postprocess', action='store_true',
                          help="Enable small-region cleanup on the raw prediction. Writes a "
                               "second file alongside the raw one, with '_postprocessed' added "
@@ -157,7 +189,8 @@ def main():
             volume = None
             if args.preprocessing:
                 time_start = time.time()
-                volume = preprocess_dicom_volume(full_file_path, LUT, circular_mask_channel3, circular_mask_channel1)
+                volume = preprocess_dicom_volume(full_file_path, LUT, circular_mask_channel3, circular_mask_channel1,
+                                                  normalize_foreground_only=args.normalize_foreground_only)
                 time_end = time.time()
                 if volume is None:
                     print(f"Skipping prediction for {dcm_file} due to preprocessing failure.")

@@ -11,7 +11,7 @@
 #SBATCH -e slurm_output/_slurm_error_predict_%j.txt
 #SBATCH --exclude=dlc-mewtwo
 
-cd /data/diag/rubenvdw/Pipeline_OCTAIDlite/Pipeline/
+cd /data/diag/rubenvdw/CARA_Pipelines_Segmentationmodels/Pipeline_OCTAIDlite/Pipeline/
 
 pip install -U segmentation-models-pytorch numba einops
 
@@ -25,6 +25,6 @@ python3 -u Pipeline_withoutinternalsaving.py \
     --radius 352 \
     --preprocessing  \
     --predict \
-    --postprocessing_connected_component_dict /data/diag/rubenvdw/Pipeline_OCTAIDlite/Model_info/Pixels_postprocessing.txt \
-    --model_path_student "/data/diag/rubenvdw/Pipeline_OCTAIDlite/Model_info/Dataset601_TS3D3_exp9_Hardloss_manual_pseudo_Softloss_pseudo_artefactexclusionsevereframes_entropy5%/fold_0/Last_model_checkpoint.pth" \
+    --postprocessing_connected_component_dict /data/diag/rubenvdw/CARA_Pipelines_Segmentationmodels/Pipeline_OCTAIDlite/Model_info/Pixels_postprocessing.txt \
+    --model_path_student "/data/diag/rubenvdw/CARA_Pipelines_Segmentationmodels/Pipeline_OCTAIDlite/Model_info/Dataset601_TS3D3_exp9_Hardloss_manual_pseudo_Softloss_pseudo_artefactexclusionsevereframes_entropy5%/fold_0/Last_model_checkpoint.pth" \
     --model_name_student UNet \
