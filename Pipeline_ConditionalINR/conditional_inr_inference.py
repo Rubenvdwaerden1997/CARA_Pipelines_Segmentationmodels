@@ -31,7 +31,7 @@ for _repo_root in (_CONDITIONAL_INR_REPO_LOCAL, _CONDITIONAL_INR_REPO_CLUSTER):
     sys.path.insert(0, str(_repo_root))
 
 from config import Config                                          # Training_model/config.py
-from model import ConditionalINR, resize_volume, resize_labels     # Training_model/model.py
+from model import ConditionalINR, resize_volume                    # Training_model/model.py
 from inference import predict_pullback                             # Training_model/inference.py
 from predict_singlepullback_conditional import build_config_from_yaml, find_yaml
 from postprocessing_conditionalinr import pixel_postprocess         # same folder
@@ -82,10 +82,24 @@ def predict_conditionalinr(
     postprocess_classes:     Optional[Mapping[int, Tuple[int, int]]] = None,
     postprocess_output_path: Optional[str] = None,
     postprocess_n_procs:     Optional[int] = 4,
+    eval_resolution:         str = "native",
 ) -> None:
-    """Resize to cfg.resize_to (if set) for inference, run predict_pullback(),
-    upsample the prediction back to native resolution, and save as .nii.gz
-    with the correct NATIVE spacing (not the resized-grid spacing).
+    """Resize to cfg.resize_to (if set) for inference, run predict_pullback() querying
+    the INR at native resolution, and save as .nii.gz with the correct NATIVE spacing
+    (not the resized-grid spacing).
+
+    eval_resolution: "native" (default, deployment behaviour) queries the INR at
+    cfg.native_xy_size whenever cfg.resize_to differs from it, so the saved
+    prediction is always full native resolution -- this is what every existing
+    caller (the batch pipeline, and Metrics/Pullback_prediction.py's default run)
+    gets, unchanged. "encoder" instead forces query_hw=None, so predict_pullback
+    queries the INR on volume_infer's own (already-resized) grid -- the prediction
+    comes back at cfg.resize_to (or native, if resize_to=0) instead. Use "encoder"
+    to score the model in isolation from the native-query decoupling: how good are
+    its own learned predictions at the resolution it was actually trained/validated
+    on, before any native-resolution query-time upscaling is applied. Ground truth
+    must be downsampled to match (nearest-neighbour, via model.resize_labels) by the
+    caller before scoring -- this function only controls the resolution of `pred`.
 
     postprocess_classes: if given, small-region cleanup runs directly on the
     in-memory native-resolution `pred` array (no disk round-trip -- fastest
@@ -108,6 +122,8 @@ def predict_conditionalinr(
     always-fp32 decode loop), so the accuracy risk isn't worth it by default.
     Opt in explicitly if you want the extra speed and can tolerate that risk.
     """
+    assert eval_resolution in ("native", "encoder"), \
+        f"eval_resolution must be 'native' or 'encoder', got {eval_resolution!r}"
     volume = volume.astype(np.float32, copy=False)
 
     if cfg.resize_to:
@@ -116,22 +132,46 @@ def predict_conditionalinr(
         volume_infer = volume
 
     D, H, W = volume_infer.shape
-    print(f"[ConditionalINR] Inference: D={D} H={H} W={W} overlap_frac={overlap_frac} "
-          f"chunk_size={chunk_size} use_amp={use_amp}")
-    pred = predict_pullback(model, volume_infer, cfg, device, chunk_size=chunk_size,
-                             overlap_frac=overlap_frac, use_amp=use_amp)  # [D,H,W] int64
-
-    # Upsample the prediction back to native resolution if it was resized down for inference,
-    # and correspondingly un-rescale xy_spacing (Config.__post_init__ scaled it UP for the
-    # smaller resize_to grid; saving the native-resolution prediction needs the native spacing).
-    if cfg.resize_to and cfg.resize_to != cfg.native_xy_size:
-        pred = resize_labels(torch.from_numpy(pred), cfg.native_xy_size).numpy()
-        native_xy_spacing = cfg.xy_spacing * (cfg.resize_to / cfg.native_xy_size)
+    # Query the INR at native resolution whenever the encoder input was downsized rather
+    # than nearest-neighbor-upsampling the discrete (post-argmax) prediction afterward.
+    # decode_3d/normalize_coords_3d decouple query-coordinate resolution from encoder-input
+    # resolution (Training_model/model.py), so predict_pullback's query_hw genuinely
+    # re-evaluates the continuous INR at every native pixel -- this used to instead resize
+    # a coarse resize_to-resolution label mask up to native with resize_labels, which is a
+    # cruder, blockier/staircased approximation of the same thing. query_hw=None (native ==
+    # resize_to, or no resize at all) keeps predict_pullback's own default behaviour.
+    #
+    # eval_resolution="encoder" overrides this: query_hw stays None regardless of
+    # resize_to, so predict_pullback queries on volume_infer's own (H, W) instead --
+    # i.e. the model's own training/validation resolution, not native. Used to score
+    # the model in isolation from the native-query decoupling (see docstring).
+    if eval_resolution == "encoder":
+        query_hw = None
     else:
-        native_xy_spacing = cfg.xy_spacing
+        query_hw = cfg.native_xy_size if (cfg.resize_to and cfg.resize_to != cfg.native_xy_size) else None
+    print(f"[ConditionalINR] Inference: D={D} H={H} W={W} overlap_frac={overlap_frac} "
+          f"chunk_size={chunk_size} use_amp={use_amp} eval_resolution={eval_resolution} query_hw={query_hw}")
+    pred = predict_pullback(model, volume_infer, cfg, device, chunk_size=chunk_size,
+                             overlap_frac=overlap_frac, use_amp=use_amp,
+                             query_hw=query_hw)  # [D, query_hw or H, query_hw or W] int64
+
+    # out_xy_spacing is the correct physical pixel spacing for whatever grid `pred`
+    # actually landed on above:
+    #   - eval_resolution="encoder": pred is on volume_infer's own (resize_to, or
+    #     native if resize_to=0) grid -- cfg.xy_spacing already IS that grid's
+    #     spacing (Config.__post_init__ rescales it up from native when resize_to
+    #     is set), no further conversion needed.
+    #   - eval_resolution="native" (default): pred is native resolution -- undo
+    #     Config.__post_init__'s upscaling to recover the true native spacing.
+    if eval_resolution == "encoder":
+        out_xy_spacing = cfg.xy_spacing
+    elif cfg.resize_to and cfg.resize_to != cfg.native_xy_size:
+        out_xy_spacing = cfg.xy_spacing * (cfg.resize_to / cfg.native_xy_size)
+    else:
+        out_xy_spacing = cfg.xy_spacing
 
     img = sitk.GetImageFromArray(pred.astype(np.int16))
-    img.SetSpacing([native_xy_spacing, native_xy_spacing, cfg.z_spacing])
+    img.SetSpacing([out_xy_spacing, out_xy_spacing, cfg.z_spacing])
     sitk.WriteImage(img, str(output_file_path))
     print(f"Saved -> {output_file_path}")
 
@@ -141,6 +181,6 @@ def predict_conditionalinr(
         cleaned = pixel_postprocess(pred, postprocess_classes, num_classes=cfg.num_classes,
                                      n_procs=postprocess_n_procs)
         post_img = sitk.GetImageFromArray(cleaned.astype(np.int16))
-        post_img.SetSpacing([native_xy_spacing, native_xy_spacing, cfg.z_spacing])
+        post_img.SetSpacing([out_xy_spacing, out_xy_spacing, cfg.z_spacing])
         sitk.WriteImage(post_img, str(postprocess_output_path))
         print(f"Saved -> {postprocess_output_path}")

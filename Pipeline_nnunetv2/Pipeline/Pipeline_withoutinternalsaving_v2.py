@@ -19,6 +19,56 @@ from Pipeline_nnunetv2.Pipeline.postprocessing_v2 import pixel_postprocess
 
 default_num_processes = 8
 
+def strip_pullback_extension(raw_id):
+    """Strip a trailing .dcm/.nii.gz/.nii extension (case-insensitive) and
+    surrounding whitespace from an Excel ID cell, e.g. 'NL-RUMC-00002-1-1.dcm'
+    -> 'NL-RUMC-00002-1-1'."""
+    s = str(raw_id).strip()
+    for suffix in ('.nii.gz', '.dcm', '.nii'):
+        if s.lower().endswith(suffix):
+            return s[: -len(suffix)]
+    return s
+
+
+def find_nifti_files(root_dir):
+    """Recursively map lowercased '<id>' (from '<id>.nii.gz') to the full
+    path of that file under root_dir, so an Excel ID can be resolved to a
+    file living in any subfolder."""
+    mapping = {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        for fn in filenames:
+            if fn.lower().endswith('.nii.gz'):
+                stem = fn[: -len('.nii.gz')]
+                mapping[stem.lower()] = os.path.join(dirpath, fn)
+    return mapping
+
+
+def resolve_files_from_excel(excel_file, id_column, sheet_name, data_input):
+    df = pd.read_excel(excel_file, sheet_name=sheet_name)
+    if id_column not in df.columns:
+        raise ValueError(f"Column '{id_column}' not found in {excel_file}. Available columns: {list(df.columns)}")
+    raw_ids = df[id_column].dropna().tolist()
+
+    nifti_map = find_nifti_files(data_input)
+
+    files_to_process = []
+    missing = []
+    for raw_id in raw_ids:
+        base_id = strip_pullback_extension(raw_id)
+        match = nifti_map.get(base_id.lower())
+        if match is None:
+            missing.append(base_id)
+            continue
+        files_to_process.append((match, base_id))
+
+    print(f"Resolved {len(files_to_process)}/{len(raw_ids)} Excel ID(s) to a '<id>.nii.gz' file under {data_input}.")
+    if missing:
+        preview = missing[:20]
+        print(f"Warning: {len(missing)} ID(s) had no matching file (skipped): {preview}"
+              f"{' ...' if len(missing) > len(preview) else ''}")
+    return files_to_process
+
+
 def apply_connected_component_analysis(dict_loc):
     with open(dict_loc) as f:
         myData = f.read()
@@ -26,20 +76,30 @@ def apply_connected_component_analysis(dict_loc):
 
     return classesPixels
 
-def preprocess_data(args, full_input_filename, LUT):
-    file_name = full_input_filename.split('\\')[-1]
+def load_raw_array(full_input_filename):
+    """Load a raw pullback as (frames, H, W, 3) uint8 RGB, from either a
+    .dcm file (pydicom, deferred pixel-data read) or a .nii/.nii.gz file
+    (SimpleITK, RGB-encoded the same way as the .dcm pullbacks)."""
+    name = full_input_filename.lower()
+    if name.endswith('.dcm'):
+        series_inputdata = pydicom.dcmread(
+            full_input_filename,
+            defer_size='512 KB',  # Skip file size calculation
+            force=False           # Skip unnecessary conversions
+        )
+        return series_inputdata.pixel_array
+    if name.endswith('.nii.gz') or name.endswith('.nii'):
+        ref_img = sitk.ReadImage(full_input_filename)
+        return sitk.GetArrayFromImage(ref_img)
+    raise ValueError(f"Unsupported pullback file type: {full_input_filename} (expected .dcm or .nii/.nii.gz)")
 
-    # Remove the .dcm extension
-    pullback_name = file_name.replace('.dcm', '')
+
+def preprocess_data(args, full_input_filename, LUT):
+    pullback_name = os.path.basename(full_input_filename)
 
     print('Reading pullback: ', pullback_name)
     #Load the input files to create a list of slices
-    series_inputdata = pydicom.dcmread(
-        full_input_filename,
-        defer_size='512 KB',  # Skip file size calculation
-        force=False           # Skip unnecessary conversions
-    )
-    series_array_inputdata = series_inputdata.pixel_array
+    series_array_inputdata = load_raw_array(full_input_filename)
     if len(series_array_inputdata.shape) == 3:
         print('Input data is 3D, but should be 4D (frames, height, width, channels)')
         print(f'File {full_input_filename} is not processed, please check the input shape! \n')
@@ -49,8 +109,9 @@ def preprocess_data(args, full_input_filename, LUT):
         print(f'File {full_input_filename} is not processed, please check the input shape! \n')
         return None
 
+    series_array_inputdata = series_array_inputdata[..., :3].astype(np.uint8, copy=False)  # drop alpha if present, match dcm's uint8 RGB
     inverted_circular_mask_dcm = np.invert(circular_mask_dcm)
-    series_array_inputdata *= inverted_circular_mask_dcm
+    series_array_inputdata = series_array_inputdata * inverted_circular_mask_dcm
     masked_series_array_inputdata_gray = rgb_to_gray_lut(series_array_inputdata, LUT)
     masked_series_array_inputdata_gray = masked_series_array_inputdata_gray.astype(np.float32, copy=False)
     mean = masked_series_array_inputdata_gray.mean()
@@ -125,8 +186,11 @@ def predict_teachermodel(frames_array_input_image, output_folder_file,
 if __name__ == '__main__':
     try:
         parser = argparse.ArgumentParser(description="Script for preprocessing and prediction")
-        parser.add_argument('--data_input', type=str, default=r'C:\Users\z923198\Documents\CFT', help="Path to input folder.")
+        parser.add_argument('--data_input', type=str, default=r'C:\Users\z923198\Documents\CFT', help="Path to input folder. In plain mode, .dcm files directly inside this folder are processed. With --excel_file, this folder (searched recursively, including subfolders) is instead searched for a '<id>.nii.gz' file per Excel row.")
         parser.add_argument('--data_output', type=str, default=r'C:\Users\z923198\Documents\CFT', help="Path to output folder.")
+        parser.add_argument('--excel_file', type=str, default=None, help="Excel file listing pullback IDs to process (one per row). When given, --data_input is searched recursively for '<id>.nii.gz' per row instead of listing .dcm files directly in --data_input.")
+        parser.add_argument('--id_column', type=str, default='DICOM_file', help="Column in --excel_file holding the pullback ID (a trailing .dcm/.nii/.nii.gz extension, if present, is stripped before searching for '<id>.nii.gz').")
+        parser.add_argument('--sheet_name', type=str, default='0', help="Sheet name or 0-based index in --excel_file (default: first sheet).")
         parser.add_argument('--k', type=int, default=3, help="Number of frames to sample around.")
         parser.add_argument('--radius', type=int, default=352, help="Radius for processing.")
         parser.add_argument('--preprocessing', action='store_true', help="Enable preprocessing.")
@@ -149,19 +213,22 @@ if __name__ == '__main__':
         if not os.path.exists(output_folder_teacher):
             os.makedirs(output_folder_teacher)
             print(f"Output folder '{output_folder_teacher}' created.")
-        dcm_files = [f for f in os.listdir(input_folder) if f.endswith('.dcm')]
+        if args.excel_file:
+            sheet_name = int(args.sheet_name) if args.sheet_name.lstrip('-').isdigit() else args.sheet_name
+            files_to_process = resolve_files_from_excel(args.excel_file, args.id_column, sheet_name, input_folder)
+        else:
+            pullback_files = sorted(f for f in os.listdir(input_folder)
+                                    if f.lower().endswith(('.dcm', '.nii.gz', '.nii')))
+            if not pullback_files:
+                print("No .dcm/.nii.gz/.nii files found in the specified folder.")
+            files_to_process = [(os.path.join(input_folder, f), strip_pullback_extension(f)) for f in pullback_files]
 
-        if not dcm_files:
-            print("No .dcm files found in the specified folder.")
-
-        print(f"Found {len(dcm_files)} .dcm files. Starting processing...")
-
+        print(f"Found {len(files_to_process)} file(s). Starting processing...")
 
         predictor_reinitiate_teacher = None
-        for dcm_file in dcm_files:
+        for full_file_path, pullback_name in files_to_process:
             time_start_loop = time.time()
-            full_file_path = os.path.join(input_folder, dcm_file)
-            output_file_path_teacher = os.path.join(output_folder_teacher, dcm_file.replace('.dcm', '_predictions.nii.gz'))
+            output_file_path_teacher = os.path.join(output_folder_teacher, f'{pullback_name}_predictions.nii.gz')
             print(f"Processing: {full_file_path}")
             if os.path.exists(output_file_path_teacher):
                 print(f"Output file '{output_file_path_teacher}' already exists. Skipping processing for this file.")
@@ -174,7 +241,7 @@ if __name__ == '__main__':
                 frames_array = preprocess_data(args, full_file_path, LUT)
                 time_end = time.time()
                 if frames_array is None:
-                    print(f"Skipping prediction for {dcm_file} due to preprocessing failure.")
+                    print(f"Skipping prediction for {pullback_name} due to preprocessing failure.")
                     continue
                 else:
                     print(f"Preprocessing time: {time_end - time_start} seconds")
@@ -190,9 +257,9 @@ if __name__ == '__main__':
                 print(f"Prediction + Postprocessing time: {time_end - time_start} seconds")
                 print("Prediction complete, results saved.")
             else:
-                print(f"Skipping prediction for {dcm_file} as preprocessing is not enabled or frames_array is None.")
+                print(f"Skipping prediction for {pullback_name} as preprocessing is not enabled or frames_array is None.")
             time_end_loop = time.time()
-            print(f"Total processing time for teacher prediction {dcm_file}: {time_end_loop - time_start_loop} seconds")
+            print(f"Total processing time for teacher prediction {pullback_name}: {time_end_loop - time_start_loop} seconds")
             print("###########################################\n")
         print("All files processed.")
 

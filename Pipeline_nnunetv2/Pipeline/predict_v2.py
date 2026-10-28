@@ -359,7 +359,11 @@ def predict_from_files(input_array, predictor_reinitiate):
     parser.add_argument("--postprocessing_connected_component_dict", type=str, required=False, default="/data/diag/rubenvdw/nnunetv2/nnUNet/nnunetv2/Data_info/Pixels_postprocessing.txt")
     parser.add_argument('--num_runs', type=int, default=1, help="Number of runs for timing.")
 
-    args = parser.parse_args()
+    # parse_known_args (not parse_args): this re-parses the whole process's
+    # sys.argv independently of Pipeline_withoutinternalsaving_v2.py's own
+    # parser, so any flag added there that this parser doesn't know about
+    # (e.g. --excel_file) must not blow up here.
+    args, _ = parser.parse_known_args()
 
     args.f = [i if i == 'all' else int(i) for i in args.f]
 
